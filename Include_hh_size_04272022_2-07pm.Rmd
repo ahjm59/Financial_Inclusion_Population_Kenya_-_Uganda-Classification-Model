@@ -1,0 +1,631 @@
+---
+title: "Include hh_size"
+author: "Binh Minh An Nguyen"
+date: "4/26/2022"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data ETL
+
+```{r package, echo=FALSE}
+options(scipen = 4)
+library(tidyverse)
+library(glmnet)
+library(corrplot)
+library(boot)
+library(broom)
+library(car)
+library(klaR)
+```
+
+
+```{r bank-acct}
+bank_acct <- read_csv("./Train.csv")
+```
+
+
+```{r}
+bank_acct_clean <- bank_acct %>% 
+  filter(year == 2018) %>% 
+  filter(job_type != "Dont Know/Refuse to answer", marital_status != "Dont know") %>% 
+  mutate(
+    marital_status = case_when(marital_status == "Divorce/Separate" ~ "Divorce",
+                               marital_status == "Married/Living together" ~ "Married",
+                               marital_status == "Single/Never Married" ~ "Single",
+                               TRUE ~ "Widowed"),
+    education_level = case_when(
+      education_level %in% c("No formal education", "Other/Dont know/RTA") ~ "Others",
+      education_level == "Primary education" ~ "Primary School",
+      education_level == "Secondary education" ~ "Secondary School",
+      TRUE ~ education_level),
+    age = age_of_respondent,
+    gender = gender_of_respondent,
+    bank_account = case_when(bank_account == "Yes" ~ 1,
+                             TRUE ~ 0)
+  ) %>% 
+  dplyr::select(-c(age_of_respondent, gender_of_respondent, year, uniqueid))
+
+# Sampling the Uganda - Government Dependent job_type
+RNGkind(sample.kind="default")
+set.seed(1)
+uganda_gvt <- bank_acct_clean %>% 
+  filter(country == "Uganda", job_type == "Government Dependent")
+sample <- sample(nrow(uganda_gvt), 0.5 * nrow(uganda_gvt))
+uganda_gvt_sample <- uganda_gvt[sample,]
+
+# Add the sample data to bank_account data
+bank_acct_smp <- bank_acct_clean %>% rbind(uganda_gvt_sample)
+
+bank_acct_smp <- bank_acct_smp %>% 
+  mutate_if(is.character, as_factor)
+```
+
+
+```{r}
+bank_acct_smp$relationship_with_head <- relevel(bank_acct_smp$relationship_with_head, "Other non-relatives")
+bank_acct_smp$education_level <- relevel(bank_acct_smp$education_level, "Others")
+bank_acct_smp$marital_status <- relevel(bank_acct_smp$marital_status, "Single")
+bank_acct_smp$country <- relevel(bank_acct_smp$country, "Uganda")
+```
+
+# Logistic Regression - with household_size
+
+```{r}
+bank.fit <- glm(bank_account~., 
+                 data = bank_acct_smp,
+                 family = binomial(link = "logit"))
+summary(bank.fit)
+
+log.odds <- coef(bank.fit)
+odds <- exp(log.odds)
+prob <- odds/(1+odds)
+cbind(log.odds, odds, prob)
+
+dev.dif <- abs(bank.fit$null.deviance - bank.fit$deviance)
+dev.Rsq <- (bank.fit$null.deviance - bank.fit$deviance)/bank.fit$null.deviance
+dev.Rsq
+
+cond.index(bank.fit, data = bank_acct_smp)
+vif(bank.fit)
+```
+
+
+
+1. Fit the model on train set
+
+```{r}
+RNGkind(sample.kind = "default")
+set.seed(1)
+
+
+tr.size <- 0.7
+train <- sample(nrow(bank_acct_smp), tr.size*nrow(bank_acct_smp))
+bank.train <- bank_acct_smp[train, ]
+bank.test <- bank_acct_smp[-train, ]
+
+fit.train <- glm(bank_account~.,
+                 data = bank.train,
+                 family = binomial(link = "logit"))
+summary(fit.train)
+
+# Compute R-sq - deviance
+dev.dif <- abs(fit.train$null.deviance - fit.train$deviance)
+dev.Rsq <- (fit.train$null.deviance - fit.train$deviance)/fit.train$null.deviance
+dev.Rsq
+
+# Coefficients
+log.odds.train <- coef(fit.train)
+odds.train <- exp(log.odds.train)
+prob.train <- odds.train/(1+odds.train)
+cbind(log.odds.train, odds.train, prob.train)
+
+# Train MSE and RMSE
+train.mse <- mean(fit.train$residuals ^ 2)
+train.rmse <- sqrt(train.mse)
+cbind("MSE Train" = train.mse, "RMSE Train" = train.rmse)
+```
+
+
+2. Model validating on test set
+
+```{r}
+pred.test <- predict(fit.train, bank.test, type = "response")
+head(pred.test)
+
+test.mse.rscv <- mean((bank.test$bank_account - pred.test)^2)
+test.rmse.rscv <- sqrt(test.mse.rscv)
+cbind("RSCV Test MSE" = test.mse.rscv,
+      "RSCV Test RMSE" = test.rmse.rscv)
+```
+
+3. Add ROC Curve and Confusion Matrix
+
+```{r}
+# Confusion Matrix
+thresh <- 0.5
+bank.prob.test <-ifelse(pred.test > thresh, 1, 0)
+conf.mat <- table("Predicted" = bank.prob.test, "Actual" = bank.test$bank_account)
+colnames(conf.mat)<-c("No","Yes")
+rownames(conf.mat)<-c("No","Yes")
+conf.mat
+
+# ROC Curve
+library(ROCR)
+
+pred <- prediction(bank.prob.test, bank.test$bank_account)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, colorize = T)
+
+auc <- performance(pred, "auc")
+auc.name <- auc@y.name[[1]]
+auc.val <- round(auc@y.values[[1]], digits = 3)
+paste(auc.name, auc.val)
+```
+
+4. CV RMSE - full model
+
+```{r}
+test.mse.10f <- cv.glm(bank_acct_smp, bank.fit, K = 10)$delta[1]
+test.rmse.10f <- sqrt(test.mse.10f)
+cbind("10FCV Test MSE" = test.mse.10f,
+      "10FCV Test RMSE" = test.rmse.10f)
+```
+
+
+
+# Random Forest 
+
+```{r}
+library(caret)
+
+as.factor(ifelse(bank_acct_smp$bank_account == 0, "No", "Yes")) -> bank_acct_smp$bank_account
+bank_acct_smp$bank_account <- relevel(bank_acct_smp$bank_account, "Yes")
+
+set.seed(1)
+bank_acct_smp$bank_account <- as.factor(bank_acct_smp$bank_account)
+train <- sample(1:nrow(bank_acct_smp), 0.7*nrow(bank_acct_smp))
+bank.rf.train <- bank_acct_smp[train, ]
+bank.rf.test<-bank_acct_smp[-train, ]
+
+
+fitControl1 <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            search = "random",
+                            repeats = 1,
+                            savePredictions = T)
+modelFitrf <- train(bank_account~.,
+                    data = bank.rf.train,
+                    method = "rf",
+                    trControl = fitControl1,
+                    tuneLength = 10,
+                    ntree = 100)
+
+modelFitrf$bestTune
+plot(varImp(modelFitrf, scale = F), main = "Var Imp: RF 10-FCV")
+```
+
+```{r}
+sub_rf1=subset(modelFitrf$pred, modelFitrf$pred$mtry==modelFitrf$bestTune$mtry)
+caret::confusionMatrix(table(sub_rf1$pred, sub_rf1$obs))
+```
+
+
+**Confusion Matrix for the test set**
+
+```{r}
+thresh <- 0.5
+pred.prob.rf.50 <- predict(modelFitrf, bank.rf.test, type = "prob")
+rf.pred.50 <- ifelse(pred.prob.rf.50[,1] > thresh, 1, 0)
+
+
+confmat <- table("Predicted" = rf.pred.50, 
+                 "Actual" = bank.rf.test$bank_account)
+confmat
+
+TruN <- confmat[1,2] # True negatives
+TruP <- confmat[2,1] # True positives
+FalN <- confmat[1,1] # False negatives
+FalP <- confmat[2,2] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+rf.rates.50 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(rf.rates.50)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+rf.rates.50
+```
+
+
+2. Random forest with Threshold = 0.3
+
+```{r}
+thresh <- 0.3
+pred.prob.rf.30 <- predict(modelFitrf, bank.rf.test, type = "prob")
+rf.pred.30 <- ifelse(pred.prob.rf.30[,1] > thresh, 1, 0)
+
+confmat <- table("Predicted" = rf.pred.30, "Actual" = bank.rf.test$bank_account) 
+confmat
+
+TruN <- confmat[1,2] # True negatives
+TruP <- confmat[2,1] # True positives
+FalN <- confmat[1,1] # False negatives
+FalP <- confmat[2,2] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+rf.rates.30 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(rf.rates.30)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+rf.rates.30
+```
+
+
+2. Random forest with Threshold = 0.7
+
+```{r}
+thresh <- 0.7
+pred.prob.rf.70 <- predict(modelFitrf, bank.rf.test, type = "prob")
+rf.pred.70 <- ifelse(pred.prob.rf.70[,1] > thresh, 1, 0)
+
+confmat <- table("Predicted" = rf.pred.70, "Actual" = bank.rf.test$bank_account) 
+confmat
+
+TruN <- confmat[1,2] # True negatives
+TruP <- confmat[2,1] # True positives
+FalN <- confmat[1,1] # False negatives
+FalP <- confmat[2,2] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+rf.rates.70 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(rf.rates.70)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+rf.rates.70
+```
+
+**Combine**
+
+```{r}
+AllStats <- round(rbind(rf.rates.30,
+                        rf.rates.50,
+                        rf.rates.70),
+                  digits = 3)
+rownames(AllStats) <- c("Threshold = 30%",
+                        "Threshold = 50%",
+                        "Threshold = 70%")
+AllStats
+```
+
+
+### ROCR Curve for Random Forest (on the test set)
+
+```{r}
+library(ROCR)
+
+pred.rf <- prediction(rf.pred.50, bank.rf.test$bank_account) 
+perf.rf <- performance(pred.rf, "tpr", "fpr")
+
+plot(perf.rf, colorize = T)
+
+auc.rf <- performance(pred.rf,"auc") # Compute the AUC
+
+auc.name.rf <- auc.rf@y.name[[1]] # Retrieve the AUC label text
+auc.value.rf <- round(auc.rf@y.values[[1]], digits = 3) # Retrieve the AUC value, rounded
+
+paste(auc.name.rf, "is", auc.value.rf)
+```
+
+
+### CV for Random Forest
+
+```{r}
+library(caret)
+
+set.seed(1)
+
+fitControl1 <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            search = "random",
+                            repeats = 1,
+                            savePredictions = T)
+modelFitrf <- train(bank_account~.,
+                    data = bank_acct_smp,
+                    method = "rf",
+                    trControl = fitControl1,
+                    tuneLength = 10,
+                    ntree = 100)
+
+modelFitrf$bestTune
+plot(varImp(modelFitrf, scale = F), main = "Var Imp: RF 10-FCV")
+```
+
+```{r}
+sub_rf1=subset(modelFitrf$pred, modelFitrf$pred$mtry==modelFitrf$bestTune$mtry)
+caret::confusionMatrix(table(sub_rf1$pred, sub_rf1$obs))
+```
+
+# Boosted Tree
+
+```{r}
+library("gbm")
+
+set.seed(1)
+
+tr.size <- 0.7
+train <- sample(1:nrow(bank_acct_smp), 
+                tr.size * nrow(bank_acct_smp)) # Train index
+
+bank.boost.train <- bank_acct_smp[train,]
+bank.boost.test <- bank_acct_smp[-train,] 
+
+bank.boost.train$bank_account <- as.numeric(bank.boost.train$bank_account)
+boost.bank <- gbm(bank_account~.,
+                  data = bank.boost.train,
+                  distribution = "bernoulli",
+                  shrinkage = 0.01,
+                  cv.folds = 10,
+                  n.trees = 3500, 
+                  interaction.depth = 1)
+boost.bank
+
+# Number of boosted trees with the smallest CV test error
+best.num.trees <- which.min(boost.bank$cv.error)
+best.num.trees
+
+# The smallest CV Test Error
+min.10FCV.error <- round(min(boost.bank$cv.error), digit=4)
+min.10FCV.error
+
+# Display result
+paste("Min 10-FCV Test Error" = min.10FCV.error, "at" , best.num.trees,"trees")
+summary(boost.bank)
+
+# Plotting the graph
+plot(boost.bank$cv.error, type = "l", xlab = "Number of Trees", ylab = "CV Test MSE")
+```
+
+### Confusion matrix for Boosted Tree
+
+```{r}
+# Threshold = 0.5
+thresh <- 0.5
+pred.boost.50 <- predict(boost.bank, bank.boost.test, type = "response")
+boost.pred.prob.50 <- ifelse(pred.boost.50 > thresh, 1, 0)
+
+confmat <- table("Predicted" = boost.pred.prob.50, "Actual" = bank.boost.test$bank_account) 
+confmat
+
+TruN <- confmat[1,1] # True negatives
+TruP <- confmat[2,2] # True positives
+FalN <- confmat[1,2] # False negatives
+FalP <- confmat[2,1] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+boost.rates.50 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(boost.rates.50)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+boost.rates.50
+```
+
+
+**Threshold = 0.3**
+
+```{r}
+thresh <- 0.3
+pred.boost.30 <- predict(boost.bank, bank.boost.test, type = "response")
+boost.pred.prob.30 <- ifelse(pred.boost.30 > thresh, 1, 0)
+
+confmat <- table("Predicted" = boost.pred.prob.30, "Actual" = bank.boost.test$bank_account) 
+confmat
+
+TruN <- confmat[1,1] # True negatives
+TruP <- confmat[2,2] # True positives
+FalN <- confmat[1,2] # False negatives
+FalP <- confmat[2,1] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+boost.rates.30 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(boost.rates.30)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+boost.rates.30
+```
+
+
+**Threshold = 0.7**
+
+```{r}
+thresh <- 0.7
+pred.boost.70 <- predict(boost.bank, bank.boost.test, type = "response")
+boost.pred.prob.70 <- ifelse(pred.boost.70 > thresh, 1, 0)
+
+confmat <- table("Predicted" = boost.pred.prob.70, "Actual" = bank.boost.test$bank_account) 
+confmat
+
+TruN <- confmat[1,1] # True negatives
+TruP <- confmat[2,2] # True positives
+FalN <- confmat[1,2] # False negatives
+FalP <- confmat[2,1] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+boost.rates.70 <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(boost.rates.70)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+boost.rates.70
+```
+
+
+**Combine**
+
+```{r}
+AllStats <- round(rbind(boost.rates.30,
+                        boost.rates.50,
+                        boost.rates.70),
+                  digits = 3)
+rownames(AllStats) <- c("Threshold = 30%",
+                        "Threshold = 50%",
+                        "Threshold = 70%")
+AllStats
+```
+
+
+
+### ROCR Curve Boosted Tree
+
+```{r}
+# ROCR Curve
+library(ROCR)
+
+pred.boost <- prediction(boost.pred.prob.50, bank.boost.test$bank_account) 
+perf.boost <- performance(pred.boost, "tpr", "fpr")
+
+plot(perf.boost, colorize = T)
+
+auc.boost <- performance(pred.boost,"auc") # Compute the AUC
+
+auc.name.boost <- auc.boost@y.name[[1]] # Retrieve the AUC label text
+auc.value.boost <- round(auc.boost@y.values[[1]], digits = 3) # Retrieve the AUC value, rounded
+
+paste(auc.name.boost, "is", auc.value.boost)
+```
+
+
+
+
+
+## CV for Boosted Tree (whole dataset)
+
+```{r}
+bank_acct_smp$bank_account <- as.numeric(bank_acct_smp$bank_account)
+boost.bank <- gbm(bank_account~.,
+                  data = bank_acct_smp,
+                  distribution = "bernoulli",
+                  shrinkage = 0.01,
+                  cv.folds = 10,
+                  n.trees = 3500, 
+                  interaction.depth = 1)
+boost.bank
+
+# Confusion Matrix
+thresh <- 0.5
+  
+pred.boost.full <- predict(boost.bank, bank_acct_smp, type = "response")
+boost.pred.prob.full <- ifelse(pred.boost.full > thresh, 1, 0)
+
+confmat <- table("Predicted" = boost.pred.prob.full, "Actual" = bank_acct_smp$bank_account) 
+confmat
+
+TruN <- confmat[1,1] # True negatives
+TruP <- confmat[2,2] # True positives
+FalN <- confmat[1,2] # False negatives
+FalP <- confmat[2,1] # False positives
+TotN <- TruN + FalP # Total negatives
+TotP <- TruP + FalN # Total positives
+Tot <- TotN + TotP # Total
+
+c("TruN"=TruN, "TruP"=TruP, "FalN"=FalN, "FalP"=FalP, 
+  "TotN"=TotN, "TotP"=TotP, "Tot"=Tot)
+
+Accuracy.Rate <- (TruN + TruP) / Tot
+Error.Rate <- (FalN + FalP) / Tot
+Sensitivity <- TruP / TotP
+Specificity <- TruN / TotN
+FalP.Rate <- 1 - Specificity
+
+boost.rates.full <- c(Accuracy.Rate, Error.Rate, Sensitivity, Specificity, FalP.Rate)
+
+names(boost.rates.full)=c("Accuracy Rate", "Error Rate", 
+                       "Sensitivity", "Specificity", "False Positives")
+boost.rates.full
+```
+
+
+
+# APPENDIX
+
+## Stepwise for logistic regression
+
+```{r}
+bank.null <- lm(bank_account~1, data = bank_acct_smp, family = binomial(link = "logit"))
+
+bank.fit.step <- step(bank.fit, 
+                      scope = list(lower = bank.null, 
+                                   upper = bank.fit), 
+                      direction = "both", 
+                      test = "F")
+
+summary(bank.fit.step)
+```
+
